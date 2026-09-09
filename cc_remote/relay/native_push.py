@@ -21,7 +21,6 @@ from dataclasses import dataclass, replace
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Awaitable, Callable, Mapping
-from urllib.parse import urlsplit
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -29,6 +28,7 @@ from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
 
 from cc_remote.config import valid_machine_id
 from cc_remote.log import logger
+from cc_remote.relay.origins import canonical_https_origin
 
 log = logger("cc_remote.relay.native_push")
 
@@ -522,19 +522,20 @@ class NativePushStore:
 
 
 NativePushSessionCheck = Callable[[NativePushInstallation, str], Awaitable[bool]]
+NativePushOrigin = Callable[[NativePushInstallation], Awaitable[str | None]]
 
 
 class NativePushDispatcher:
     def __init__(self, store: NativePushStore, provider: APNsProvider, *, origin: str,
                  session_active: NativePushSessionCheck, clock: Callable[[], float] = time.time,
-                 max_attempts: int = 3) -> None:
-        parsed = urlsplit(origin)
-        if (parsed.scheme != "https" or not parsed.hostname or parsed.username
-                or parsed.password or parsed.query or parsed.fragment or parsed.path):
+                 max_attempts: int = 3, origin_for: NativePushOrigin | None = None) -> None:
+        if not (canonical_https_origin(origin) or (origin == "auto" and callable(origin_for))):
             raise ValueError("native push requires an exact HTTPS origin")
         if not callable(session_active) or not 1 <= max_attempts <= 5:
             raise ValueError("native push requires live session authorization")
-        self.store, self.provider, self.origin = store, provider, origin
+        self.store, self.provider = store, provider
+        self.origin = canonical_https_origin(origin) or "auto"
+        self._origin_for = origin_for
         self._session_active, self._clock, self.max_attempts = session_active, clock, max_attempts
         self._wake = asyncio.Event()
         self._worker: asyncio.Task | None = None
@@ -598,19 +599,25 @@ class NativePushDispatcher:
                       and isinstance(space, str) and space in {"code", "work"})
         if kind == "completion" and not classified:
             return
-        route = {"v": 1, "origin": self.origin, "machine_id": machine_id,
+        route = {"v": 1, "machine_id": machine_id,
                  "session_id": sid, "event_kind": kind, "event_id": event_id}
         if classified:
             route.update(engine=engine, space=space)
         if ask_id is not None:
             route["ask_id"] = ask_id
-        payload = json.dumps({"aps": {"alert": {"title": "Remote", "body": body}, "sound": "default"}, "cc_remote": route}, ensure_ascii=False, separators=(",", ":")).encode()
-        if len(payload) > 4096:
-            return
         for installation in await self.store.for_machine(machine_id):
             if (kind not in installation.event_kinds or installation.topic != self.provider.topic
                     or installation.environment not in self.provider.environments
                     or (target_client_id is not None and installation.client_id != target_client_id)):
+                continue
+            origin = (await self._origin_for(installation)
+                      if self.origin == "auto" and self._origin_for else self.origin)
+            if not origin or canonical_https_origin(origin) != origin:
+                continue
+            payload = json.dumps({"aps": {"alert": {"title": "Remote", "body": body}, "sound": "default"},
+                                  "cc_remote": {**route, "origin": origin}},
+                                 ensure_ascii=False, separators=(",", ":")).encode()
+            if len(payload) > 4096:
                 continue
             # Stable across registration refresh and replay; no raw token/jti in
             # the identifier or payload. APNs ID/collapse ID reuse bounds retry duplicates.

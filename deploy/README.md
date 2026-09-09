@@ -108,17 +108,56 @@ directory:
 
 ```bash
 cp env.relay.docker.example env.relay   # then fill in the secrets
+chmod 600 env.relay
 docker compose up -d --build
-curl https://your-domain/healthz        # -> {"ok":true,...}
+curl http://127.0.0.1:8765/healthz       # -> {"ok":true,...}
 ```
 
-The compose file publishes the relay only to the host loopback
-(`127.0.0.1:8765`) and mounts a named volume for the SQLite device/Web Push
-state. Public TLS + WebSocket termination stays with your existing front.
+Fill in `LOGIN_PASSWORD` (at least 16 characters), `SESSION_SECRET`, and
+`WRAPPER_TOKEN`. Generate each secret separately with `openssl rand -hex 32`.
+The wrapper uses the same wrapper token. APNs and Web Push settings are optional.
+No public domain or certificate belongs in this configuration.
+
+The compose file uses bridge networking and a `8765:8765` port mapping. The left
+side is the host port; for example, `18765:8765` publishes the container's port
+8765 on host port 18765. A named volume preserves device/Web Push/APNs state.
+
+In Nginx Proxy Manager, add a Proxy Host with these settings:
+
+| Setting | Value |
+| --- | --- |
+| Domain Names | Your public domain, configured only in NPM |
+| Scheme | `http` |
+| Forward Hostname / IP | The Docker host address reachable from NPM |
+| Forward Port | The left-hand port in the compose mapping |
+| Websockets Support | Enabled |
+| SSL | Select/request a certificate and enable Force SSL |
+
+When NPM runs in another container, `127.0.0.1` points to NPM itself; use the
+Docker host's reachable address instead. Limit access to the published upstream
+port to the proxy, using an appropriate bind address and host/network rules.
+Open the HTTPS domain to log in. Direct HTTP remains useful for `/healthz`,
+but browser login in this deployment requires HTTPS.
+
+The image defaults to `PUBLIC_ORIGIN=auto`: the proxy must preserve the original
+Host header, as NPM does by default. The relay requires an exact
+`Origin=https://<Host>` match for browser writes/WebSockets and always sets
+Secure cookies, even though the upstream connection is HTTP. Each login is
+bound to its own origin, which also supplies its APNs navigation links. No
+domain is learned globally, and forwarded host/protocol headers cannot relax
+these checks. Forwarded client IPs from Docker bridge peers are not trusted;
+such clients share the proxy peer's login rate limit.
+
+For an existing `env.relay`, remove the old domain-specific `PUBLIC_ORIGIN`
+assignment (or set it to `auto`) and any loopback-only `RELAY_HOST` override.
+Leave `ALLOW_INSECURE_HTTP` and `ALLOW_PRIVATE_ORIGINS` disabled in auto mode.
+Rebuild with `docker compose up -d --build` after updating the checkout.
 
 **nginx instead of Caddy.** `nginx-reverse-proxy.conf.example` terminates TLS
-and proxies the `/ws` WebSocket to `127.0.0.1:8765`. Keep it loopback-only:
-the relay trusts forwarded transport metadata only from loopback peers.
+and proxies the `/ws` WebSocket to `127.0.0.1:8765`. This example uses a
+host-installed proxy. An explicitly pinned `PUBLIC_ORIGIN` still requires the
+trusted effective request scheme to match, so retain loopback proxy transport
+for that topology; use auto mode for the Docker/NPM bridge topology above.
 
 **Mainland-China mirrors.** The Docker build defaults to PyPI.org. Behind the
 GFW, build with Aliyun as the primary index and TUNA as the fallback (both

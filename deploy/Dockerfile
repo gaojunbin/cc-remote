@@ -30,8 +30,9 @@ FROM python:3.13-slim-bookworm AS relay
 ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    RELAY_HOST=127.0.0.1 \
+    RELAY_HOST=0.0.0.0 \
     RELAY_PORT=8765 \
+    PUBLIC_ORIGIN=auto \
     WEB_STATIC_DIR=/app/web/dist \
     PUSH_DB_PATH=/app/state/relay-push.sqlite3 \
     APNS_DB_PATH=/app/state/relay-apns.sqlite3 \
@@ -69,7 +70,7 @@ COPY --from=web-build --chown=ccremote:ccremote /src/web/dist ./web/dist/
 EXPOSE 8765
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/healthz', timeout=4)" || exit 1
+    CMD python -c "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:' + os.environ.get('RELAY_PORT', '8765') + '/healthz', timeout=4)" || exit 1
 
 USER ccremote
 

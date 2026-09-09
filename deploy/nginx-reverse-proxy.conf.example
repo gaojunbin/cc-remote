@@ -4,8 +4,9 @@
 # proxies the WebSocket (deploy/Caddyfile). If you already run nginx as the
 # only front on this host, use this file as the alternative. The relay
 # deliberately trusts forwarded transport metadata only from loopback peers, so
-# nginx MUST run on the same host and proxy to the relay's loopback address
-# (with the Docker compose file, that is 127.0.0.1:8765 on host networking).
+# this host-installed nginx example proxies to the relay's loopback address.
+# Docker uses bridge port publishing and PUBLIC_ORIGIN=auto instead; see
+# deploy/README.md for the Nginx Proxy Manager setup without a pinned domain.
 #
 # Bootstrap on a fresh host:
 #   1. Point an A/AAAA record for cc-remote.example.com at this VPS and open

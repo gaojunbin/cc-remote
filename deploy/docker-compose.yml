@@ -4,15 +4,16 @@
 # This compose file runs the same relay inside a container for isolated,
 # memory-bounded VPSes, or for any host that already terminates TLS itself.
 #
-# Public TLS/WebSocket termination is expected to stay with nginx or another
-# host reverse proxy: the relay is published only to the host loopback here,
-# and the relay only trusts forwarded transport metadata from loopback peers.
-# See nginx-reverse-proxy.conf.example for the nginx alternative to Caddy.
+# Configure the public domain and HTTPS only in Nginx Proxy Manager (or another
+# reverse proxy). Forward HTTP to the Docker host's published port, preserve
+# Host, and enable WebSocket support. PUBLIC_ORIGIN=auto in the image requires
+# HTTPS browser access and checks Origin against Host without trusting
+# caller-supplied forwarding headers. Restrict the published port to your proxy.
 #
 # Usage (from this deploy/ directory):
 #   cp env.relay.docker.example env.relay   # then fill in the secrets
 #   docker compose up -d --build
-#   curl https://your-domain/healthz        # -> {"ok":true,...}
+#   curl http://127.0.0.1:8765/healthz       # -> {"ok":true,...}
 services:
   relay:
     build:
@@ -21,14 +22,11 @@ services:
     image: cc-remote-relay:latest
     container_name: cc-remote-relay
     restart: unless-stopped
-    # Host networking so the relay sees loopback peers. The relay only trusts
-    # forwarded transport metadata (X-Forwarded-Proto / X-Forwarded-For) from
-    # 127.0.0.1 and ::1; the Docker bridge gateway is not one of those, so a
-    # normal `ports:` mapping would make it ignore the proxy headers and reject
-    # the HTTPS PUBLIC_ORIGIN. With host networking the relay binds loopback
-    # only (RELAY_HOST=127.0.0.1), which the host nginx/Caddy reaches directly.
-    # Linux hosts only; the `ports:` mapping is ignored under host networking.
-    network_mode: host
+    # HOST_PORT:CONTAINER_PORT. Change the left side to suit your host.
+    # NPM in another container must use the Docker host's reachable address,
+    # not 127.0.0.1 (which would refer to NPM's own container).
+    ports:
+      - "8765:8765"
     env_file:
       - env.relay
     volumes:

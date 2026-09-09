@@ -48,11 +48,17 @@ local `claude` or `codex` session through a WebSocket relay. Two independent lin
 - **Auth is URL-secret-free**: the wrapper uses `Authorization: Bearer <token>`
   at WS upgrade. Web clients POST `LOGIN_PASSWORD` to `/api/login` and receive a
   short-lived HttpOnly/SameSite cookie; `/ws` enforces exact `PUBLIC_ORIGIN`.
+  Docker defaults to `PUBLIC_ORIGIN=auto` for an HTTPS reverse proxy preserving
+  Host: require `Origin=https://<Host>`, bind each login to that origin, and
+  always set Secure cookies. Never infer HTTPS from caller-supplied Origin or
+  forwarding headers, learn a global domain from a request, or combine auto
+  mode with private/insecure HTTP. APNs uses the installation's live login
+  origin without adding an independent persisted authorization grant.
   When `ALLOW_PRIVATE_ORIGINS=1`, the only additional origins are literal
   private/loopback IPs on `RELAY_PORT`, and their scheme/host/port must match
-  the effective request target. Cookie `Secure` follows that trusted request
-  transport, never the caller's Origin. Uvicorn trusts forwarded transport
-  metadata only from loopback Caddy. Never put tokens in URLs or protocol
+  the effective request target. Outside auto mode, Cookie `Secure` follows that
+  trusted request transport, never the caller's Origin. Uvicorn trusts forwarded
+  transport metadata only from loopback Caddy. Never put tokens in URLs or protocol
   message bodies; logging redacts token/password fields.
 - **Protocol version gate**: current wire protocol v35 is declared by
   `PROTOCOL_VERSION` in both `protocol.py` and `web/src/protocol.ts`.

@@ -162,6 +162,7 @@ class RelayConfig:
     client_hello_timeout: float = field(default_factory=lambda: _float("CLIENT_HELLO_TIMEOUT", 10.0))
     # Exact browser Origin accepted for cookie-authenticated WebSockets, for
     # example https://remote.example.com (no path or trailing slash).
+    # "auto" delegates the domain to an HTTPS reverse proxy that preserves Host.
     public_origin: str = field(default_factory=lambda: _env("PUBLIC_ORIGIN", ""))
     # Optional same-port browser access through literal private/loopback IPs.
     # PUBLIC_ORIGIN remains the canonical external origin; this narrowly adds
@@ -473,6 +474,13 @@ def validate_relay_config(cfg: RelayConfig) -> None:
         errors.append("DEVICE_PAIRING_TTL_SECONDS must be between 60 and 3600")
 
     origin = cfg.public_origin.strip()
+    if origin == "auto":
+        cfg.public_origin = origin
+        if cfg.allow_insecure_http or cfg.allow_private_origins:
+            errors.append("PUBLIC_ORIGIN=auto requires HTTPS; private/insecure HTTP options must be disabled")
+        if errors:
+            raise ValueError("invalid relay configuration: " + "; ".join(errors))
+        return
     try:
         parsed = urlsplit(origin)
         hostname = parsed.hostname

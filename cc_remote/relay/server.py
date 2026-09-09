@@ -4,8 +4,8 @@ origin.
 
 Auth: wrapper authenticates with a Bearer WRAPPER_TOKEN header; web clients
 authenticate with a Secure HttpOnly session cookie obtained from /api/login.
-Cookie-authenticated WebSockets must also match PUBLIC_ORIGIN, or an explicitly
-enabled same-port private-IP origin.
+Cookie-authenticated WebSockets must match PUBLIC_ORIGIN, the HTTPS request
+Host in auto mode, or an explicitly enabled same-port private-IP origin.
 
 The relay never imports claude_agent_sdk and never touches the model API.
 """
@@ -38,6 +38,7 @@ from cc_remote.relay.auth import (
     make_session_token, session_token_claims, wrapper_machine_scope,
 )
 from cc_remote.relay.devices import DeviceStore
+from cc_remote.relay.origins import request_https_origin
 from cc_remote.relay.pairing import RelayHub
 from cc_remote.relay.native_push import APNsProvider, NativePushDispatcher, NativePushInstallation, NativePushStore
 from cc_remote.relay.native_push_router import NativePushRouter
@@ -173,6 +174,7 @@ _pair_limiter = LoginRateLimiter(max_per_ip=30)
 class _SessionEntry:
     expires_at: int
     claims: SessionClaims | None = None
+    origin: str = ""
     revoked: asyncio.Event = field(default_factory=asyncio.Event)
 
 
@@ -189,16 +191,18 @@ class SessionRegistry:
             if entry.expires_at <= now:
                 del self._entries[jti]
 
-    async def register(self, claims: SessionClaims) -> bool:
+    async def register(self, claims: SessionClaims, *, origin: str = "") -> bool:
         async with self._lock:
             self._prune_locked(time.time())
             if claims.jti in self._entries or len(self._entries) >= self.cap:
                 return False
-            self._entries[claims.jti] = _SessionEntry(claims.expires_at, claims=claims)
+            self._entries[claims.jti] = _SessionEntry(claims.expires_at, claims=claims, origin=origin)
             return True
 
-    async def active(self, claims: SessionClaims) -> bool:
-        return await self.active_id(claims.jti, claims.expires_at)
+    async def active(self, claims: SessionClaims, *, origin: str | None = None) -> bool:
+        if not await self.active_id(claims.jti, claims.expires_at):
+            return False
+        return origin is None or await self.origin_for(claims.jti, claims.expires_at) == origin
 
     async def active_id(self, jti: str, expires_at: float) -> bool:
         async with self._lock:
@@ -211,6 +215,12 @@ class SessionRegistry:
             self._prune_locked(time.time())
             entry = self._entries.get(jti)
             return entry.claims if entry is not None and entry.expires_at == expires_at else None
+
+    async def origin_for(self, jti: str, expires_at: float) -> str | None:
+        async with self._lock:
+            self._prune_locked(time.time())
+            entry = self._entries.get(jti)
+            return entry.origin if entry is not None and entry.expires_at == expires_at else None
 
     async def subscribe(self, claims: SessionClaims) -> Optional[asyncio.Event]:
         async with self._lock:
@@ -318,9 +328,9 @@ def _request_target_parts(
     )
 
 
-def _request_cookie_secure(req: Request) -> bool:
-    """Select Secure from the trusted effective request transport."""
-    return req.url.scheme.lower() == "https"
+def _request_cookie_secure(req: Request, cfg: RelayConfig) -> bool:
+    """Auto mode requires TLS at the proxy even though its upstream uses HTTP."""
+    return cfg.public_origin == "auto" or req.url.scheme.lower() == "https"
 
 
 def _rate_limited(ip: str) -> bool:
@@ -335,6 +345,12 @@ def _request_origin_allowed(
 ) -> bool:
     """Bind an accepted browser Origin to the effective request target."""
     origin = req.headers.get("origin", "").strip()
+    if cfg.public_origin == "auto":
+        target = request_https_origin(req)
+        # Do not learn a global domain from the first request, trust Origin as
+        # transport evidence, or accept arbitrary forwarded host/proto headers.
+        return (target is not None and len(req.headers.getlist("origin")) <= 1
+                and (origin == target or (not origin and allow_missing)))
     if not origin:
         return allow_missing
     return (
@@ -393,7 +409,8 @@ async def _active_claims(
     if (
         claims is None
         or claims.expires_at <= time.time()
-        or not await sessions.active(claims)
+        or not await sessions.active(
+            claims, origin=(request_https_origin(req) or "") if cfg.public_origin == "auto" else None)
     ):
         return None
     return claims
@@ -577,9 +594,14 @@ def create_app(
                 environments=tuple(cfg.apns_environments.split(",")),
             )
         native_store = NativePushStore(cfg.apns_db_path)
+
+        async def native_origin(installation: NativePushInstallation) -> str | None:
+            return await sessions.origin_for(installation.session_jti, installation.expires_at)
+
         native_dispatcher = NativePushDispatcher(
             native_store, native_push_provider, origin=cfg.public_origin,
             session_active=native_session_active,
+            origin_for=native_origin if cfg.public_origin == "auto" else None,
         )
         native_router = NativePushRouter(native_dispatcher)
     push_store: PushSubscriptionStore | None = None
@@ -873,7 +895,7 @@ def create_app(
         )
         claims = session_token_claims(token, cfg.session_secret)
         assert claims is not None
-        if not await sessions.register(claims):
+        if not await sessions.register(claims, origin=request_https_origin(req) or ""):
             log.warning("session registry full", ip=ip)
             return JSONResponse({"error": "session_capacity"}, status_code=503)
         log.info("login ok", ip=ip, exp=exp)
@@ -885,7 +907,7 @@ def create_app(
             token,
             max_age=cfg.session_ttl_seconds,
             path="/",
-            secure=_request_cookie_secure(req),
+            secure=_request_cookie_secure(req, cfg),
             httponly=True,
             samesite="strict",
         )
@@ -893,13 +915,8 @@ def create_app(
 
     @app.get("/api/session")
     async def session_status(req: Request) -> JSONResponse:
-        token = req.cookies.get(SESSION_COOKIE_NAME, "")
-        claims = session_token_claims(token, cfg.session_secret)
-        if (
-            claims is None
-            or claims.expires_at <= time.time()
-            or not await sessions.active(claims)
-        ):
+        claims = await _active_claims(req, cfg, sessions)
+        if claims is None:
             return JSONResponse(
                 {"ok": False}, status_code=401, headers={"Cache-Control": "no-store"}
             )
@@ -919,7 +936,10 @@ def create_app(
             )
         token = req.cookies.get(SESSION_COOKIE_NAME, "")
         claims = session_token_claims(token, cfg.session_secret)
-        if claims is not None:
+        if claims is not None and (
+            cfg.public_origin != "auto"
+            or await sessions.origin_for(claims.jti, claims.expires_at) == request_https_origin(req)
+        ):
             # Revoke first: a slow database cleanup must not extend delivery.
             await sessions.revoke(claims.jti)
             if push_store is not None:
@@ -930,7 +950,7 @@ def create_app(
         response.delete_cookie(
             SESSION_COOKIE_NAME,
             path="/",
-            secure=_request_cookie_secure(req),
+            secure=_request_cookie_secure(req, cfg),
             httponly=True,
             samesite="strict",
         )
@@ -1149,7 +1169,9 @@ def create_app(
                 claims is not None
                 and claims.expires_at > time.time()
                 and origin_ok
-                and await sessions.active(claims)
+                and await sessions.active(
+                    claims, origin=(request_https_origin(websocket) or "")
+                    if cfg.public_origin == "auto" else None)
             ):
                 role = "client"
             elif token and not origin_ok:
