@@ -439,6 +439,7 @@ cryptography==48.0.0 \
     --hash=sha256:fdfef35d751d510fcef5252703621574364fec16418c4a1e5e1055248401054b
     # via
     #   -c requirements.lock
+    #   -r requirements-relay.txt
     #   http-ece
     #   py-vapid
     #   pywebpush
@@ -596,6 +597,18 @@ h11==0.16.0 \
     #   -c requirements.lock
     #   httpcore
     #   uvicorn
+h2==4.4.1 \
+    --hash=sha256:0e25f1462b23c9cb82d9eb02e28bc706dac2a68cb457c6a0d74d63c8a2a5d0e6 \
+    --hash=sha256:4e866ffb1a869ae14dd9b5e6beb5c24a13da0495ad72b65925ded182521c1516
+    # via
+    #   -c requirements.lock
+    #   httpx
+hpack==4.2.0 \
+    --hash=sha256:0895cfa3b5531fc65fe439c05eb65144f123bf7a394fcaa56aa423548d8e45c0 \
+    --hash=sha256:858ac0b02280fa582b5080d68db0899c62a80375e0e5413a74970c5e518b6986
+    # via
+    #   -c requirements.lock
+    #   h2
 http-ece==1.2.1 \
     --hash=sha256:8c6ab23116bbf6affda894acfd5f2ca0fb8facbcbb72121c11c75c33e7ce8cff
     # via
@@ -613,6 +626,13 @@ httpx==0.28.1 \
     # via
     #   -c requirements.lock
     #   -r requirements-common.txt
+    #   -r requirements-relay.txt
+hyperframe==6.1.0 \
+    --hash=sha256:b03380493a519fce58ea5af42e4a42317bf9bd425596f7a0835ffce80f1a42e5 \
+    --hash=sha256:f630908a00854a7adeabd6382b43923a4c4cd4b821fcb527e6ab9e15382a3b08
+    # via
+    #   -c requirements.lock
+    #   h2
 idna==3.18 \
     --hash=sha256:7f952cbe720b688055e3f87de14f5c3e5fdaa8bc3928985c4077ca689de849a2 \
     --hash=sha256:ffb385a7e039654cef1ab9ef32c6fafe283c0c0467bba1d9029738ce4a14a848

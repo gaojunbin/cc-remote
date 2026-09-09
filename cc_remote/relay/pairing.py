@@ -52,9 +52,11 @@ class RelayHub:
         cfg: RelayConfig,
         *,
         on_live_turn_end: WrapperEventHook | None = None,
+        on_native_event: WrapperEventHook | None = None,
     ):
         self.cfg = cfg
         self._on_live_turn_end = on_live_turn_end
+        self._on_native_event = on_native_event
         self._event_tasks: set[asyncio.Task[None]] = set()
         # Preserve the original attributes as the default-machine fast path and
         # test/integration compatibility surface.
@@ -268,6 +270,13 @@ class RelayHub:
                 await self._wrapper_gone(machine_id, ws)
 
     async def _on_wrapper_msg(self, msg, machine_id: str = "default") -> None:
+        if self._on_native_event is not None:
+            # The hook only projects bounded metadata/enqueues local work;
+            # provider HTTP requests never block wrapper/client transport.
+            try:
+                await self._on_native_event(machine_id, msg)
+            except Exception:
+                log.warning("native push event could not be queued")
         if msg.type == "hello" and getattr(msg, "role", None) == "wrapper":
             log.info("wrapper announced", cc_session_id=msg.cc_session_id,
                      state=msg.state, head=msg.buffer_head_seq, tail=msg.buffer_tail_seq)

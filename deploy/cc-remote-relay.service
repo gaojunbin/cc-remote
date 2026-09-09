@@ -17,8 +17,9 @@ LimitCORE=0
 
 # Relay only reads the current immutable release, shared .env, and static web
 # build under /opt. The dedicated state directory is the sole persistent
-# writable path and holds Web Push subscriptions plus the hashed device
-# enrollment registry. Conversation/session data never enters either database.
+# writable path and holds Web Push subscriptions, the hashed device enrollment
+# registry, and optional APNs installations/delivery metadata. APNs stores only
+# routing identifiers and fixed alerts; conversation content stays local.
 # Keep all other paths visible but read-only; private /tmp remains available to
 # Python and uploaded request bodies.
 NoNewPrivileges=true

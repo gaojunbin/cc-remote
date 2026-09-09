@@ -18,9 +18,12 @@ import os
 import re
 import time
 from collections import defaultdict
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 from urllib.parse import urlsplit
+from uuid import UUID
 
 from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import JSONResponse
@@ -36,6 +39,8 @@ from cc_remote.relay.auth import (
 )
 from cc_remote.relay.devices import DeviceStore
 from cc_remote.relay.pairing import RelayHub
+from cc_remote.relay.native_push import APNsProvider, NativePushDispatcher, NativePushInstallation, NativePushStore
+from cc_remote.relay.native_push_router import NativePushRouter
 from cc_remote.relay.push import (
     PushDispatcher, PushOutcome, PushSubscription, PushSubscriptionStore,
 )
@@ -167,6 +172,7 @@ _pair_limiter = LoginRateLimiter(max_per_ip=30)
 @dataclass
 class _SessionEntry:
     expires_at: int
+    claims: SessionClaims | None = None
     revoked: asyncio.Event = field(default_factory=asyncio.Event)
 
 
@@ -188,7 +194,7 @@ class SessionRegistry:
             self._prune_locked(time.time())
             if claims.jti in self._entries or len(self._entries) >= self.cap:
                 return False
-            self._entries[claims.jti] = _SessionEntry(claims.expires_at)
+            self._entries[claims.jti] = _SessionEntry(claims.expires_at, claims=claims)
             return True
 
     async def active(self, claims: SessionClaims) -> bool:
@@ -199,6 +205,12 @@ class SessionRegistry:
             self._prune_locked(time.time())
             entry = self._entries.get(jti)
             return entry is not None and entry.expires_at == expires_at
+
+    async def claims_for(self, jti: str, expires_at: float) -> SessionClaims | None:
+        async with self._lock:
+            self._prune_locked(time.time())
+            entry = self._entries.get(jti)
+            return entry.claims if entry is not None and entry.expires_at == expires_at else None
 
     async def subscribe(self, claims: SessionClaims) -> Optional[asyncio.Event]:
         async with self._lock:
@@ -522,13 +534,54 @@ def create_app(
     cfg: Optional[RelayConfig] = None,
     *,
     device_store: DeviceStore | None = None,
+    native_push_provider: APNsProvider | None = None,
 ) -> FastAPI:
     if cfg is None:
         cfg = relay_config()
     validate_relay_config(cfg)
-    app = FastAPI(title="cc-remote relay")
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        if native_dispatcher is not None and native_router is not None:
+            await native_dispatcher.start()
+            await native_router.start()
+        try:
+            yield
+        finally:
+            if native_router is not None:
+                await native_router.close()
+            if native_dispatcher is not None:
+                await native_dispatcher.close()
+
+    app = FastAPI(title="cc-remote relay", lifespan=lifespan)
     sessions = SessionRegistry(cfg.session_registry_cap)
     devices = device_store or DeviceStore(cfg.device_db_path)
+    native_store: NativePushStore | None = None
+    native_dispatcher: NativePushDispatcher | None = None
+    native_router: NativePushRouter | None = None
+
+    async def native_session_active(installation: NativePushInstallation, machine_id: str) -> bool:
+        claims = await sessions.claims_for(installation.session_jti, installation.expires_at)
+        return (claims is not None and _push_subject(claims) == installation.subject
+                and machine_id in installation.machine_ids
+                and await _claims_allow_machine(claims, machine_id, devices)
+                # Device-store I/O may yield while logout revokes the session.
+                and await sessions.active(claims))
+
+    if cfg.apns_key_path:
+        if native_push_provider is None:
+            key_file = Path(cfg.apns_key_path)
+            if not key_file.is_file() or key_file.stat().st_size > 16 * 1024:
+                raise ValueError("APNS_KEY_PATH must name a PEM key file of at most 16 KiB")
+            native_push_provider = APNsProvider(
+                cfg.apns_team_id, cfg.apns_key_id, cfg.apns_topic, key_file.read_bytes(),
+                environments=tuple(cfg.apns_environments.split(",")),
+            )
+        native_store = NativePushStore(cfg.apns_db_path)
+        native_dispatcher = NativePushDispatcher(
+            native_store, native_push_provider, origin=cfg.public_origin,
+            session_active=native_session_active,
+        )
+        native_router = NativePushRouter(native_dispatcher)
     push_store: PushSubscriptionStore | None = None
     push_dispatcher: PushDispatcher | None = None
     if cfg.push_vapid_public_key:
@@ -559,7 +612,8 @@ def create_app(
             context=context,
         )
 
-    hub = RelayHub(cfg, on_live_turn_end=on_live_turn_end)
+    hub = RelayHub(cfg, on_live_turn_end=on_live_turn_end,
+                   on_native_event=native_router.observe if native_router is not None else None)
     login_slots = asyncio.Semaphore(cfg.login_inflight_cap)
     app.state.hub = hub
     app.state.sessions = sessions
@@ -567,6 +621,9 @@ def create_app(
     app.state.push_store = push_store
     app.state.push_dispatcher = push_dispatcher
     app.state.device_store = devices
+    app.state.native_push_store = native_store
+    app.state.native_push_dispatcher = native_dispatcher
+    app.state.native_push_router = native_router
 
     @app.middleware("http")
     async def static_shell_cache_policy(req: Request, call_next):
@@ -609,6 +666,93 @@ def create_app(
             },
             headers={"Cache-Control": "no-store"},
         )
+
+    @app.get("/api/native-push/config")
+    async def native_push_config(req: Request) -> JSONResponse:
+        if await _active_claims(req, cfg, sessions) is None:
+            return JSONResponse({"ok": False}, status_code=401, headers={"Cache-Control": "no-store"})
+        enabled = native_dispatcher is not None
+        return JSONResponse({"enabled": enabled,
+                             "event_kinds": ["completion", "attention"] if enabled else [],
+                             "environments": cfg.apns_environments.split(",") if enabled else [],
+                             "topic": cfg.apns_topic if enabled else ""}, headers={"Cache-Control": "no-store"})
+
+    @app.put("/api/native-push/installation")
+    async def native_push_register(req: Request) -> JSONResponse:
+        if not _request_origin_allowed(req, cfg, allow_missing=False):
+            return JSONResponse({"error": "origin_rejected"}, status_code=403)
+        claims = await _active_claims(req, cfg, sessions)
+        if claims is None:
+            return JSONResponse({"ok": False}, status_code=401)
+        if native_store is None:
+            return JSONResponse({"error": "push_disabled"}, status_code=503)
+        try:
+            body = await asyncio.wait_for(_read_json_limited(req, _PUSH_BODY_MAX_BYTES), timeout=10)
+        except _BodyTooLarge:
+            return JSONResponse({"error": "too_large"}, status_code=413)
+        except asyncio.TimeoutError:
+            return JSONResponse({"error": "request_timeout"}, status_code=408)
+        except Exception:
+            return JSONResponse({"error": "bad_request"}, status_code=400)
+        try:
+            expected = {"installation_id", "device_token", "environment", "machine_ids", "client_id", "privacy", "event_kinds"}
+            if not isinstance(body, dict) or set(body) != expected:
+                raise ValueError
+            installation_id = str(UUID(body["installation_id"]))
+            token = body["device_token"]
+            if not isinstance(token, str) or not re.fullmatch(r"(?:[0-9a-fA-F]{2}){1,512}", token):
+                raise ValueError
+            machines = body["machine_ids"]
+            if (not isinstance(machines, list) or not 1 <= len(machines) <= 64
+                    or any(not isinstance(m, str) or not valid_machine_id(m) for m in machines)
+                    or len(machines) != len(set(machines))):
+                raise ValueError
+            if body["environment"] not in cfg.apns_environments.split(",") or body["privacy"] != "generic":
+                raise ValueError
+            client_id = body["client_id"]
+            if not isinstance(client_id, str) or not re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", client_id):
+                raise ValueError
+            kinds = body["event_kinds"]
+            if (not isinstance(kinds, list) or not 1 <= len(kinds) <= 2
+                    or any(kind not in {"completion", "attention"} for kind in kinds)
+                    or len(kinds) != len(set(kinds))):
+                raise ValueError
+        except (ValueError, TypeError, AttributeError):
+            return JSONResponse({"error": "invalid_installation"}, status_code=400)
+        for machine_id in machines:
+            if not await _claims_allow_machine(claims, machine_id, devices):
+                return JSONResponse({"error": "device_forbidden"}, status_code=403)
+        if not await sessions.active(claims):
+            return JSONResponse({"ok": False}, status_code=401)
+        installation = NativePushInstallation(
+            installation_id=installation_id, subject=_push_subject(claims), session_jti=claims.jti,
+            expires_at=claims.expires_at, device_token=token.lower(), machine_ids=tuple(machines),
+            topic=cfg.apns_topic, environment=body["environment"], client_id=client_id,
+            event_kinds=tuple(kinds), privacy="generic",
+        )
+        try:
+            await native_store.upsert(installation)
+        except ValueError:
+            return JSONResponse({"error": "invalid_installation"}, status_code=400)
+        if not await sessions.active(claims):
+            await native_store.remove_session(claims.jti)
+            return JSONResponse({"ok": False}, status_code=401)
+        return JSONResponse({"ok": True, "installation_id": installation_id}, headers={"Cache-Control": "no-store"})
+
+    @app.delete("/api/native-push/installation/{installation_id}")
+    async def native_push_unregister(installation_id: str, req: Request) -> JSONResponse:
+        if not _request_origin_allowed(req, cfg, allow_missing=False):
+            return JSONResponse({"error": "origin_rejected"}, status_code=403)
+        claims = await _active_claims(req, cfg, sessions)
+        if claims is None:
+            return JSONResponse({"ok": False}, status_code=401)
+        try:
+            installation_id = str(UUID(installation_id))
+        except ValueError:
+            return JSONResponse({"error": "invalid_installation"}, status_code=400)
+        if native_store is not None:
+            await native_store.remove_installation(_push_subject(claims), installation_id, session_jti=claims.jti)
+        return JSONResponse({"ok": True}, headers={"Cache-Control": "no-store"})
 
     @app.post("/api/push/subscribe")
     async def push_subscribe(req: Request) -> JSONResponse:
@@ -776,9 +920,12 @@ def create_app(
         token = req.cookies.get(SESSION_COOKIE_NAME, "")
         claims = session_token_claims(token, cfg.session_secret)
         if claims is not None:
+            # Revoke first: a slow database cleanup must not extend delivery.
+            await sessions.revoke(claims.jti)
             if push_store is not None:
                 await push_store.remove_session(claims.jti)
-            await sessions.revoke(claims.jti)
+            if native_store is not None:
+                await native_store.remove_session(claims.jti)
         response = JSONResponse({"ok": True}, headers={"Cache-Control": "no-store"})
         response.delete_cookie(
             SESSION_COOKIE_NAME,
@@ -949,6 +1096,8 @@ def create_app(
         revoked = await devices.revoke(machine_id, _device_subject(claims))
         if not revoked:
             return JSONResponse({"error": "not_found"}, status_code=404)
+        if native_store is not None:
+            await native_store.remove_machine(machine_id)
         await hub.disconnect_wrapper(machine_id, reason="device revoked")
         return JSONResponse({"ok": True}, headers={"Cache-Control": "no-store"})
 

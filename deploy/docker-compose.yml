@@ -32,10 +32,13 @@ services:
     env_file:
       - env.relay
     volumes:
-      # Persistent device registry + Web Push subscription databases. The named
+      # Persistent device registry + Web Push/APNs databases. The named
       # volume inherits /app/state ownership from the image (the ccremote
       # user), so no host-side chown is needed.
       - relay-state:/app/state
+      # Optional APNs key. Set APNS_KEY_PATH=/run/secrets/apns/AuthKey.p8
+      # and make this file readable by container UID 10001 before enabling.
+      # - /opt/cc-remote/secrets/AuthKey.p8:/run/secrets/apns/AuthKey.p8:ro
     read_only: true
     tmpfs:
       - /tmp

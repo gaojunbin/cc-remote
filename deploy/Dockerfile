@@ -34,6 +34,7 @@ ENV PYTHONUNBUFFERED=1 \
     RELAY_PORT=8765 \
     WEB_STATIC_DIR=/app/web/dist \
     PUSH_DB_PATH=/app/state/relay-push.sqlite3 \
+    APNS_DB_PATH=/app/state/relay-apns.sqlite3 \
     DEVICE_DB_PATH=/app/state/relay-devices.sqlite3 \
     SESSION_TTL_SECONDS=604800 \
     LOG_LEVEL=INFO

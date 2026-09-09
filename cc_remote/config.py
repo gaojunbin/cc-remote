@@ -188,6 +188,16 @@ class RelayConfig:
     )
     push_db_path: str = field(default_factory=lambda: _env(
         "PUSH_DB_PATH", str(Path.home() / ".cc-remote" / "relay-push.sqlite3")))
+    # Optional native Apple push. Credentials stay on the relay, never in the
+    # iOS app, protocol frames, or registration response.
+    apns_team_id: str = field(default_factory=lambda: _env("APNS_TEAM_ID", "").strip())
+    apns_key_id: str = field(default_factory=lambda: _env("APNS_KEY_ID", "").strip())
+    apns_topic: str = field(default_factory=lambda: _env("APNS_TOPIC", "").strip())
+    apns_key_path: str = field(default_factory=lambda: _env("APNS_KEY_PATH", "").strip())
+    apns_environments: str = field(default_factory=lambda: _env(
+        "APNS_ENVIRONMENTS", "sandbox,production").strip())
+    apns_db_path: str = field(default_factory=lambda: _env(
+        "APNS_DB_PATH", str(Path.home() / ".cc-remote" / "relay-apns.sqlite3")))
     # Persistent enrollment metadata and hashed per-device credentials. This
     # database never contains conversations, artifacts, or plaintext tokens.
     device_db_path: str = field(default_factory=lambda: _env(
@@ -436,6 +446,24 @@ def validate_relay_config(cfg: RelayConfig) -> None:
     if (not cfg.push_db_path or "\x00" in cfg.push_db_path
             or len(cfg.push_db_path.encode("utf-8", errors="surrogatepass")) > 4096):
         errors.append("PUSH_DB_PATH must be a non-empty path of at most 4096 UTF-8 bytes")
+    apns_values = (cfg.apns_team_id, cfg.apns_key_id, cfg.apns_topic, cfg.apns_key_path)
+    if any(apns_values) and not all(apns_values):
+        errors.append("APNS_TEAM_ID, APNS_KEY_ID, APNS_TOPIC and APNS_KEY_PATH must be configured together")
+    for name, value in (("APNS_TEAM_ID", cfg.apns_team_id), ("APNS_KEY_ID", cfg.apns_key_id)):
+        if value and not re.fullmatch(r"[A-Z0-9]{10}", value):
+            errors.append(f"{name} must be 10 uppercase letters or digits")
+    if cfg.apns_topic and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]{0,254}", cfg.apns_topic):
+        errors.append("APNS_TOPIC must be the app Bundle Identifier")
+    if cfg.apns_key_path and (not Path(cfg.apns_key_path).is_absolute() or "\x00" in cfg.apns_key_path
+                             or len(cfg.apns_key_path.encode("utf-8", errors="surrogatepass")) > 4096):
+        errors.append("APNS_KEY_PATH must be an absolute path of at most 4096 UTF-8 bytes")
+    environments = cfg.apns_environments.split(",")
+    if (not environments or len(set(environments)) != len(environments)
+            or any(value not in {"sandbox", "production"} for value in environments)):
+        errors.append("APNS_ENVIRONMENTS must contain sandbox, production, or both separated by a comma")
+    if (not cfg.apns_db_path or "\x00" in cfg.apns_db_path
+            or len(cfg.apns_db_path.encode("utf-8", errors="surrogatepass")) > 4096):
+        errors.append("APNS_DB_PATH must be a non-empty path of at most 4096 UTF-8 bytes")
     if (not cfg.device_db_path or "\x00" in cfg.device_db_path
             or len(cfg.device_db_path.encode(
                 "utf-8", errors="surrogatepass")) > 4096):
