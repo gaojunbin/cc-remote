@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 from uuid import uuid4
 
-from cc_remote.protocol import State
+from cc_remote.protocol import AskUser, State
 from cc_remote.wrapper.ringbuffer import RingBuffer
 from cc_remote.wrapper.sdk import SdkHandle
 from cc_remote.wrapper.stream import StreamTranslator
@@ -283,6 +283,10 @@ class SessionContext:
     # Semantic metadata stays separate from the Future map so every answer can
     # be validated against the exact prompt that created it.
     pending_ask_specs: dict = field(default_factory=dict)
+    # One bounded, validated live question survives ring eviction and a cold
+    # client hello. Never persist it: its Future exists only in this process.
+    # ask_lock serializes all question batches, so one slot is sufficient.
+    active_ask: Optional[AskUser] = None
     # The browser presents one question card per session. Serialize whole
     # batches so concurrent tools/subagents cannot overwrite that card.
     ask_lock: asyncio.Lock = field(default_factory=asyncio.Lock)

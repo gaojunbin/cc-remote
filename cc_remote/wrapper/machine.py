@@ -6604,6 +6604,23 @@ class WrapperMachine:
                           type=getattr(msg, "type", None))
                 return
             msg.to = ctx.owner_client_id
+        if isinstance(msg, AskUser):
+            future = ctx.pending_asks.get(msg.ask_id)
+            if future is not None and future.done():
+                return  # interrupted/answered while waiting for emit_lock
+            if future is not None and not future.done():
+                # Capture the effective recipient (including private /btw)
+                # before transport can drop a disconnected live frame. This
+                # single bounded snapshot is independent of the replay ring.
+                ctx.active_ask = msg.model_copy(deep=True)
+        elif isinstance(msg, AskUserClosed):
+            if ctx.active_ask is not None and ctx.active_ask.ask_id == msg.ask_id:
+                ctx.active_ask = None
+                future = ctx.pending_asks.get(msg.ask_id)
+                if future is not None and not future.done():
+                    future.set_exception(AskCancelled())
+        elif isinstance(msg, TurnEnd) and msg.result.subtype != "steered":
+            self._cancel_pending_asks(ctx)
         if isinstance(msg, GoalState) and msg.sid:
             goal_id = self._goal_identity(msg.goal)
             dismissed = False
@@ -8002,6 +8019,11 @@ class WrapperMachine:
         return [*frames[:insert_at], seed, *frames[insert_at:]]
 
     async def _handle_client_hello(self, cmd) -> None:
+        # The authenticated relay binds a client identity and a machine route
+        # before forwarding hello. Never turn an incomplete internal hello
+        # into a broadcast of recovery state.
+        if not getattr(cmd, "client_id", None):
+            return
         # A fresh client (no cursor for a sid) gets exactly one lightweight
         # Snapshot for that session. A reconnecting client explicitly names the
         # sids it already knows and receives only seq > cursor from those rings.
@@ -8085,6 +8107,16 @@ class WrapperMachine:
                     same_generation=same_generation,
                 )
                 for frame in frames:
+                    # Preserve the original audience before applying the new
+                    # connection's delivery route. A private question/error
+                    # retained in this shared ring must remain private.
+                    if frame.to is not None and frame.to != cmd.client_id:
+                        continue
+                    # Questions are live controls, not history: reassert only
+                    # the still-pending one below. A historical AskUser can be
+                    # stale even while its closing frame is waiting to emit.
+                    if isinstance(frame, AskUser):
+                        continue
                     # Never mutate a shared ring event with per-client routing.
                     await self.transport.send(frame.model_copy(
                         deep=True, update={
@@ -8092,6 +8124,24 @@ class WrapperMachine:
                             "sid": sid,
                             "route_id": getattr(cmd, "route_id", None),
                         }))
+                active_ask = ctx.active_ask
+                if active_ask is not None:
+                    future = ctx.pending_asks.get(active_ask.ask_id)
+                    if (
+                        future is not None and not future.done()
+                        and active_ask.to in {None, cmd.client_id}
+                    ):
+                        # Unsequenced, private current state bypasses an
+                        # already-consumed cursor. emit_lock orders a later
+                        # answer/interrupt/terminal close after this seed.
+                        # Do not buffer or pass through live notification hooks.
+                        await self.transport.send(active_ask.model_copy(
+                            deep=True, update={
+                                "seq": None,
+                                "to": cmd.client_id,
+                                "sid": sid,
+                                "route_id": getattr(cmd, "route_id", None),
+                            }))
                 # ReplayStart's synthetic Snapshot predates protocol-v15 and is
                 # built by RingBuffer. Always follow replay with the current
                 # revisioned control value; same-revision delivery is idempotent.
@@ -17377,6 +17427,7 @@ class WrapperMachine:
     @staticmethod
     def _cancel_pending_asks(ctx: SessionContext) -> None:
         """Wake prompt handlers so interrupt can drain instead of waiting 30m."""
+        ctx.active_ask = None
         for future in tuple(ctx.pending_asks.values()):
             if not future.done():
                 future.set_exception(AskCancelled())
@@ -17468,6 +17519,7 @@ class WrapperMachine:
             "labels": frozenset(option["label"] for option in options),
             "allow_text": allow_text,
             "multi_select": multi_select,
+            "to": ctx.owner_client_id if ctx.btw else to,
         }
         reason = "cancelled"
         try:
@@ -17497,6 +17549,8 @@ class WrapperMachine:
             if ctx.pending_asks.get(ask_id) is fut:
                 ctx.pending_asks.pop(ask_id, None)
                 ctx.pending_ask_specs.pop(ask_id, None)
+                if ctx.active_ask is not None and ctx.active_ask.ask_id == ask_id:
+                    ctx.active_ask = None
             self._mark_claude_activity(ctx)
             try:
                 await self._emit(
@@ -17807,6 +17861,9 @@ class WrapperMachine:
         spec = ctx.pending_ask_specs.get(cmd.ask_id)
         if spec is None:
             return await reject(ERR_INTERNAL, "交互问题状态不完整，请重新操作")
+        if (spec.get("to") is not None
+                and spec["to"] != getattr(cmd, "client_id", None)):
+            return await reject(ERR_AUTH, "该交互问题属于其他客户端")
         answer = cmd.answer
         labels = spec["labels"]
         if isinstance(answer, list):
@@ -20634,6 +20691,7 @@ class WrapperMachine:
         return bool(
             ctx.state != "idle"
             or active
+            or ctx.pending_asks
             or ctx.queued_queries
             or ctx.queued_query_starting_msg_id
             or self._query_queue_task_active(ctx)
@@ -25255,7 +25313,8 @@ class WrapperMachine:
         if not bootstrap and len(self.sessions) >= self.cfg.max_concurrent_sessions:
             victim = next((k for k, c in self.sessions.items()
                            if k != self.focused_sid and c.state == "idle"
-                           and not c.btw and not c.queued_queries
+                           and not c.btw and not c.pending_asks
+                           and not c.queued_queries
                            and not self._query_queue_task_active(c)), None)
             if victim is None:
                 await reject(
@@ -26145,7 +26204,8 @@ class WrapperMachine:
         if len(self.sessions) >= self.cfg.max_concurrent_sessions:
             victim = next((k for k, c in self.sessions.items()
                            if k != self.focused_sid and c.state == "idle"
-                           and not c.btw and not c.queued_queries
+                           and not c.btw and not c.pending_asks
+                           and not c.queued_queries
                            and not self._query_queue_task_active(c)), None)
             if victim is None:
                 raise _BtwSpawnFailure(ERR_BUSY, "会话已满,先关闭一个再开 btw")
